@@ -6,11 +6,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 
 	"github.com/runreveal/pql"
@@ -49,6 +51,40 @@ func main() {
 		}
 		input.Close()
 		return err
+	}
+
+	{
+		c := &cobra.Command{
+			Use:   "eval [--table FILE [...]] [FILE [...]]",
+			Short: "Evaluate Pipeline Query Language",
+
+			DisableFlagsInUseLine: true,
+			SilenceErrors:         true,
+			SilenceUsage:          true,
+		}
+		tables := c.Flags().StringArray("table", nil, "`path` to ")
+		outputPath := c.Flags().StringP("output", "o", "", "`file` to write CSV to (defaults to stdout)")
+		c.RunE = func(cmd *cobra.Command, args []string) (err error) {
+			input, err := makeInput(args)
+			if err != nil {
+				return err
+			}
+			output, err := makeOutput(*outputPath)
+			if err != nil {
+				input.Close()
+				return err
+			}
+
+			err = runEval(cmd.Context(), *tables, output, input, func(err error) {
+				fmt.Fprintf(os.Stderr, "pql: %v\n", err)
+			})
+			if err2 := output.Close(); err == nil {
+				err = err2
+			}
+			input.Close()
+			return err
+		}
+		rootCommand.AddCommand(c)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), sigterm.Signals()...)
@@ -103,6 +139,94 @@ func run(ctx context.Context, output io.Writer, input io.Reader, logError func(e
 	}
 
 	return finalError
+}
+
+func runEval(ctx context.Context, tablePaths []string, output io.Writer, source io.Reader, logError func(error)) error {
+	scanner := bufio.NewScanner(source)
+	sb := new(strings.Builder)
+
+	if isTerminal(source) {
+		// Nudge for usage if running interactively.
+		fmt.Fprintln(os.Stderr, "Reading from terminal (use semicolons to end statements)...")
+	}
+
+	var tables []*pql.Table
+	for _, path := range tablePaths {
+		tab, err := readTable(path)
+		if err != nil {
+			return err
+		}
+		tables = append(tables, tab)
+	}
+
+	var finalError error
+	w := csv.NewWriter(output)
+	defer w.Flush()
+	for scanner.Scan() {
+		sb.Write(scanner.Bytes())
+		sb.WriteByte('\n')
+
+		statements := parser.SplitStatements(sb.String())
+		if len(statements) == 1 {
+			continue
+		}
+
+		for _, stmt := range statements[:len(statements)-1] {
+			result, err := pql.Eval(stmt, tables)
+			if err != nil {
+				logError(err)
+				finalError = errors.New("one or more statements could not be compiled")
+				continue
+			}
+			w.Write(result.Columns)
+			w.WriteAll(result.Data)
+		}
+
+		sb.Reset()
+		sb.WriteString(statements[len(statements)-1])
+	}
+
+	if stmt := sb.String(); len(parser.Scan(stmt)) > 0 {
+		result, err := pql.Eval(stmt, tables)
+		if err != nil {
+			logError(err)
+			return errors.New("one or more statements could not be compiled")
+		}
+		w.Write(result.Columns)
+		w.WriteAll(result.Data)
+	}
+
+	return finalError
+}
+
+func readTable(path string) (*pql.Table, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	tab := &pql.Table{
+		Name: strings.TrimSuffix(filepath.Base(path), ".csv"),
+	}
+	r := csv.NewReader(f)
+	tab.Columns, err = r.Read()
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, fmt.Errorf("read %s: %v", path, err)
+	}
+	for {
+		row, err := r.Read()
+		if err == io.EOF {
+			return tab, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %v", path, err)
+		}
+		tab.Data = append(tab.Data, row)
+	}
 }
 
 func makeInput(args []string) (io.ReadCloser, error) {
